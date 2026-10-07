@@ -14,7 +14,11 @@ never writers**. A child that edits the code makes the change unowned and it arr
 reasoning that produced it. You stay the writer and you own the integration. In your report, name
 which findings each child confirmed or rejected, with a reason per line.
 
-Do not exceed two. A six-child fan-out once emptied a full 5-hour window and produced nothing.
+This cap is a cost ceiling, not a trust limit. The tools are open to you and a subagent that wants
+to write code is allowed to; a six-child fan-out once emptied a full 5-hour window and produced
+nothing, so the number is what is bounded, not the capability.
+
+Do not exceed two.
 
 ## Work
 

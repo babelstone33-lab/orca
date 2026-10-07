@@ -1,6 +1,6 @@
 name: launch-plan
 max_cost_usd: 1.00
-max_subtasks: 3
+max_subtasks: 2
 
 supervisor:
   goal: "Research what problem an agent orchestration engine solves, then write one plain paragraph about it for a non-technical reader."

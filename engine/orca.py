@@ -26,6 +26,26 @@ RUNS = ROOT / "runs"
 PRICES_PATH = ROOT / "engine" / "prices.json"
 
 
+def load_dotenv(path: pathlib.Path) -> None:
+    """Load KEY=VALUE lines from .env into os.environ, without overwriting a variable the
+    real environment already set. Silent no-op if the file is absent: .env is optional.
+    ponytail: flat KEY=VALUE parser, no quoting or multiline support. Upgrade path:
+    python-dotenv if a value ever needs more than that."""
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+load_dotenv(ROOT / ".env")
+
+
 def load_prices() -> dict:
     """Per-model USD price per million tokens. Edit engine/prices.json to add or correct a
     price, no code change needed.
@@ -183,7 +203,14 @@ class Run:
             self.id = resume
             self.dir = RUNS / resume
             self.state = json.loads((self.dir / "state.json").read_text())
-            self.wf = load_structured(ROOT / "workflows" / f"{self.state['workflow']}.yaml")
+            # Fix for reviewer finding 3: reload from the exact path the run was started
+            # with, not a hardcoded workflows/<name>.yaml. Fall back to the old guess only
+            # for run directories saved before this field existed.
+            wf_path = self.state.get("workflow_path")
+            if wf_path:
+                self.wf = load_structured(pathlib.Path(wf_path))
+            else:
+                self.wf = load_structured(ROOT / "workflows" / f"{self.state['workflow']}.yaml")
             if not self.wf.get("tasks"):
                 self.wf["tasks"] = self.state.get("generated_tasks") or []
             return
@@ -193,6 +220,7 @@ class Run:
         self.dir = RUNS / self.id
         self.dir.mkdir(parents=True, exist_ok=True)
         self.state = {"run_id": self.id, "workflow": self.wf.get("name", path.stem),
+                      "workflow_path": str(path.resolve()),
                       "status": "running", "started_at": time.time(), "tasks": {},
                       "model_calls": [], "total_cost_usd": 0.0, "generated_tasks": None}
         if not self.wf.get("tasks"):
@@ -221,13 +249,7 @@ class Run:
             f"(short result name). Respond with ONLY the JSON list, no prose, no code fences."
         )
         result = call_model(agent, prompt, self.provider, self.prices)
-        self.state["model_calls"].append({
-            "task_id": "__plan__", "requested_model": agent["model"],
-            "served_model": result["served_model"], "fallback": result["fallback"],
-            "reason": result["reason"], "cost_usd": result["cost_usd"],
-            "input_tokens": result["input_tokens"], "output_tokens": result["output_tokens"],
-            "timestamp": time.time()})
-        self.state["total_cost_usd"] = round(self.state["total_cost_usd"] + result["cost_usd"], 6)
+        self.record_model_call("__plan__", agent["model"], result)
         self.log({"event": "supervisor_planned", "goal": sup["goal"], "raw": result["text"]})
         plan = parse_plan(result["text"])
         if len(plan) > cap:
@@ -254,15 +276,30 @@ class Run:
         with (self.dir / "log.jsonl").open("a") as fh:
             fh.write(json.dumps(event) + "\n")
 
+    def record_model_call(self, task_id: str, requested_model: str, result: dict):
+        """Fix for reviewer finding 4: every model call lands in log.jsonl as well as
+        state.json, so the append-only log alone can audit which model served a request and
+        what it cost, without needing the snapshot file."""
+        entry = {"task_id": task_id, "requested_model": requested_model,
+                  "served_model": result["served_model"], "fallback": result["fallback"],
+                  "reason": result["reason"], "cost_usd": result["cost_usd"],
+                  "input_tokens": result["input_tokens"], "output_tokens": result["output_tokens"],
+                  "timestamp": time.time()}
+        self.state["model_calls"].append(entry)
+        self.log({"event": "model_call", **entry})
+        self.state["total_cost_usd"] = round(self.state["total_cost_usd"] + result["cost_usd"], 6)
+
     def outputs(self) -> dict:
-        return {t["output"]: v["output"] for t, v in self.wf_outputs().items()}
+        return {name: v["output"] for name, v in self.wf_outputs().items()}
 
     def wf_outputs(self):
+        """Fix for reviewer finding 1: key by output name (a string), not the task dict
+        itself, which is unhashable and raised TypeError on every call."""
         out = {}
         for task in self.wf["tasks"]:
             name = task.get("output", task["id"])
             if name in self.state["tasks"]:
-                out[task] = self.state["tasks"][name]
+                out[name] = self.state["tasks"][name]
         return out
 
     def order(self) -> list:
@@ -309,24 +346,30 @@ class Run:
             self.state["tasks"][name] = {"task_id": task["id"], "agent": task["agent"],
                                          "status": "done", "output": result["text"],
                                          "started_at": started, "finished_at": time.time()}
-            self.state["model_calls"].append({
-                "task_id": task["id"], "requested_model": agent["model"],
-                "served_model": result["served_model"], "fallback": result["fallback"],
-                "reason": result["reason"], "cost_usd": result["cost_usd"],
-                "input_tokens": result["input_tokens"], "output_tokens": result["output_tokens"],
-                "timestamp": time.time()})
-            self.state["total_cost_usd"] = round(
-                self.state["total_cost_usd"] + result["cost_usd"], 6)
+            self.record_model_call(task["id"], agent["model"], result)
+            # Fix for reviewer findings 5 and 6: log the task_finished event, then make the
+            # state durable (save), and only then perform remember()'s disk write. A crash
+            # right after save() means the task is already marked done, so a resume will
+            # skip it and never repeat remember()'s write; the old order wrote remember()
+            # first, so a crash between remember() and save() duplicated the memory note on
+            # resume.
+            # ponytail: this trades duplication for loss. A crash between save() and
+            # remember() now means the memory note is silently never written, since resume
+            # sees the task as done and skips it. Upgrade path if that matters more than
+            # duplication: persist "remembered: false" in the task's state entry and flip it
+            # to true only after remember() returns, so resume can tell the two cases apart.
+            self.log({"event": "task_finished", "task": task["id"]})
+            self.save()
             if task.get("remember"):
                 remember(agent, task["remember"], result["text"])
-            self.save()
-            self.log({"event": "task_finished", "task": task["id"]})
         self.state["status"] = "done"
         self.save()
         return self.report()
 
     def report(self) -> dict:
-        final = self.wf["tasks"][-1]
+        # Fix for reviewer finding 2: the last task to actually run is the last one in
+        # dependency-resolved order, not the last one written in the YAML file.
+        final = self.order()[-1]
         last = self.state["tasks"].get(final.get("output", final["id"]), {})
         return {"run_id": self.id, "status": self.state["status"],
                 "total_cost_usd": self.state["total_cost_usd"],
