@@ -3,5 +3,8 @@
   "sonnet": {"input_per_mtok": 3.0, "output_per_mtok": 15.0},
   "opus": {"input_per_mtok": 15.0, "output_per_mtok": 75.0},
   "haiku": {"input_per_mtok": 0.8, "output_per_mtok": 4.0},
+  "ds/deepseek-v4-pro": {"input_per_mtok": 0.28, "output_per_mtok": 0.42},
+  "deepseek-v4-pro": {"input_per_mtok": 0.28, "output_per_mtok": 0.42},
+  "qwen3:4b": {"input_per_mtok": 0.0, "output_per_mtok": 0.0},
   "default": {"input_per_mtok": 0.0, "output_per_mtok": 0.0}
 }

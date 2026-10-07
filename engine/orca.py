@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Orca: thin agent-orchestration engine. Four primitives, no agent framework.
 
-  Agent     agents/<name>.md   YAML frontmatter (model, tools) plus a prompt body
-  Task      one entry in a workflow file: agent, instruction, depends_on, output, remember
+  Agent     agents/<name>.md   YAML frontmatter (provider, model, tool_provider, tool_model,
+                                fallback) plus a prompt body
+  Task      one entry in a workflow file: agent, instruction, depends_on, output, remember,
+                                uses_tools
   Workflow  workflows/<name>.yaml   name, max_cost_usd, tasks[]
   Run       runs/<run_id>/{state.json, log.jsonl}   durable, resumable
 
+Providers: providers.yaml, a data table (kind: openai | cli), never a class per provider.
+See docs/DESIGN.md and docs/briefs/milestone-4.md.
+
 Usage:
-  python3 engine/orca.py run workflows/hello.yaml [--provider echo|9router]
+  python3 engine/orca.py run workflows/hello.yaml [--provider echo]
   python3 engine/orca.py resume <run_id>
   python3 engine/orca.py status <run_id>
 """
@@ -17,6 +22,7 @@ import argparse
 import json
 import os
 import pathlib
+import subprocess
 import time
 import urllib.request
 import uuid
@@ -24,6 +30,7 @@ import uuid
 ROOT = pathlib.Path(os.environ.get("ORCA_HOME") or pathlib.Path(__file__).resolve().parent.parent)
 RUNS = ROOT / "runs"
 PRICES_PATH = ROOT / "engine" / "prices.json"
+PROVIDERS_PATH = pathlib.Path(os.environ.get("ORCA_PROVIDERS") or (ROOT / "providers.yaml"))
 
 
 def load_dotenv(path: pathlib.Path) -> None:
@@ -89,6 +96,14 @@ def load_structured(path: pathlib.Path):
         return json.loads(text)
 
 
+def load_structured_text(text: str):
+    try:
+        import yaml
+        return yaml.safe_load(text) or {}
+    except ImportError:
+        return json.loads(text)
+
+
 def load_agent(name: str) -> dict:
     path = ROOT / "agents" / f"{name}.md"
     raw = path.read_text()
@@ -96,19 +111,16 @@ def load_agent(name: str) -> dict:
     if raw.startswith("---"):
         _, front, body = raw.split("---", 2)
         meta = load_structured_text(front)
-    meta.setdefault("model", "sonnet")
     meta["name"] = name
     meta["prompt"] = body.strip()
     meta["memory_dir"] = ROOT / "memory" / name
+    if "provider" not in meta or "model" not in meta:
+        raise SystemExit(
+            f"agent {name!r} must declare both provider and model in its frontmatter "
+            f"(agents/{name}.md). Milestone 3's live 404 was exactly this left to a silent "
+            f"default ('model: sonnet' with no provider, against a router that has no "
+            f"Anthropic model at all); the engine now refuses rather than guessing.")
     return meta
-
-
-def load_structured_text(text: str):
-    try:
-        import yaml
-        return yaml.safe_load(text) or {}
-    except ImportError:
-        return json.loads(text)
 
 
 def memory_context(agent: dict) -> str:
@@ -135,6 +147,96 @@ def remember(agent: dict, topic: str, text: str) -> pathlib.Path:
     return path
 
 
+# ---------------------------------------------------------------------------
+# Provider registry: data, not classes. Two transports (openai, cli), one dispatch
+# function with a fallback chain. See docs/briefs/milestone-4.md.
+# ---------------------------------------------------------------------------
+
+def load_providers() -> dict:
+    """providers.yaml, one table: name -> {kind, base_url/command, auth/args,
+    capabilities, model (cli only)}. No secret in this file, only the name of an env var;
+    values live in .env."""
+    try:
+        data = load_structured(PROVIDERS_PATH)
+    except FileNotFoundError:
+        return {}
+    return (data or {}).get("providers", {})
+
+
+def agent_model_chain(agent: dict, uses_tools: bool = False) -> list:
+    """The ordered (provider, model) attempts for one call: the primary (or the
+    tool_provider/tool_model pair, but only when the task actually uses tools), then each
+    entry of agent['fallback'] parsed as 'provider:model'."""
+    if uses_tools and agent.get("tool_provider"):
+        primary = (agent["tool_provider"], agent.get("tool_model") or agent["model"])
+    else:
+        primary = (agent["provider"], agent["model"])
+    chain = [primary]
+    for entry in agent.get("fallback", []):
+        prov, _, model = entry.partition(":")
+        chain.append((prov, model))
+    return chain
+
+
+def _read_json_response(resp) -> dict:
+    """Some OpenAI-compatible endpoints (seen live on 9router) append trailing bytes after
+    a non-streaming JSON body, e.g. a stray 'data: [DONE]' SSE terminator. raw_decode reads
+    only the first complete JSON value and ignores whatever follows it, instead of failing
+    the whole response on garbage the caller never asked to stream."""
+    text = resp.read().decode()
+    obj, _ = json.JSONDecoder().raw_decode(text.strip())
+    return obj
+
+
+def fetch_model_ids(provider: dict) -> list:
+    base = provider["base_url"].rstrip("/")
+    headers = {}
+    auth = provider.get("auth", {"mode": "none"})
+    if auth.get("mode") == "bearer_env":
+        headers["Authorization"] = f"Bearer {os.environ.get(auth['var'], '')}"
+    req = urllib.request.Request(base + "/models", headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = _read_json_response(resp)
+    return [m["id"] for m in data.get("data", [])]
+
+
+def validate_providers(tasks: list, providers: dict, provider_override) -> None:
+    """Fix for the milestone-3 404: a dangling model reference refuses the whole run at
+    startup, never 404s mid-run. Checks the PRIMARY attempt of every task's agent (the
+    declared, intended route): unknown provider or a missing tools capability is always a
+    hard failure here. A model-list fetch that fails because the endpoint is simply
+    unreachable is NOT treated as a dangling-model error: that is exactly what the fallback
+    chain exists to handle at dispatch time, so it is left for dispatch to discover.
+    ponytail: one /models fetch per distinct openai provider referenced, no cross-run
+    caching. Upgrade path: a short-TTL cache if this is ever called often enough to matter."""
+    if provider_override == "echo":
+        return
+    model_lists = {}
+    for task in tasks:
+        agent = load_agent(task["agent"])
+        uses_tools = bool(task.get("uses_tools"))
+        prov_name, model = agent_model_chain(agent, uses_tools)[0]
+        provider = providers.get(prov_name)
+        if provider is None:
+            raise SystemExit(f"unknown provider {prov_name!r} referenced by agent {agent['name']!r}")
+        if uses_tools and not provider.get("capabilities", {}).get("tools", False):
+            raise SystemExit(
+                f"task {task.get('id')!r} needs tools; provider {prov_name!r} declares "
+                f"capabilities {provider.get('capabilities')}, so it is refused up front "
+                f"rather than silently downgraded")
+        if provider["kind"] != "openai":
+            continue
+        if prov_name not in model_lists:
+            try:
+                model_lists[prov_name] = set(fetch_model_ids(provider))
+            except Exception:
+                model_lists[prov_name] = None  # unreachable now; dispatch/fallback will discover it
+        ids = model_lists[prov_name]
+        if ids is not None and model not in ids:
+            raise SystemExit(
+                f"provider {prov_name!r} does not serve model {model!r}; it serves {sorted(ids)}")
+
+
 ECHO_SUPERVISOR_PLAN = json.dumps([
     {"id": "research", "agent": "researcher", "depends_on": [],
      "instruction": "In one sentence, what problem does an agent orchestration engine solve?",
@@ -147,38 +249,107 @@ ECHO_SUPERVISOR_PLAN = json.dumps([
     # never sees this string.
 
 
-def call_model(agent: dict, prompt: str, provider: str, prices: dict) -> dict:
-    model = agent["model"]
-    if provider == "echo":
-        text = ECHO_SUPERVISOR_PLAN if agent["name"] == "supervisor" else (
-            f"[echo:{model}] {prompt.splitlines()[0][:120]}")
-        usage = {"prompt_tokens": len(prompt.split()), "completion_tokens": len(text.split())}
-        served = model
-        fallback, reason = classify_fallback(model, served)
-        return {"text": text, "served_model": served, "fallback": fallback, "reason": reason,
-                "cost_usd": compute_cost(prices, served, usage),
-                "input_tokens": usage["prompt_tokens"], "output_tokens": usage["completion_tokens"]}
-    base = os.environ.get("ORCA_BASE_URL", "http://127.0.0.1:20128/v1").rstrip("/")
-    key = os.environ.get("ORCA_API_KEY", "")
+def call_echo(agent: dict, prompt: str, model: str, prices: dict) -> dict:
+    text = ECHO_SUPERVISOR_PLAN if agent["name"] == "supervisor" else (
+        f"[echo:{model}] {prompt.splitlines()[0][:120]}")
+    usage = {"prompt_tokens": len(prompt.split()), "completion_tokens": len(text.split())}
+    return {"text": text, "served_model": model, "cost_usd": compute_cost(prices, model, usage),
+            "cost_basis": "dollars", "input_tokens": usage["prompt_tokens"],
+            "output_tokens": usage["completion_tokens"]}
+
+
+def call_openai(provider: dict, model: str, agent: dict, prompt: str, prices: dict) -> dict:
+    """openai transport: any OpenAI-compatible endpoint (9router, Ollama, OpenRouter, ...).
+    Tokens and cost come from the response's usage block and engine/prices.json."""
+    base = provider["base_url"].rstrip("/")
+    headers = {"Content-Type": "application/json"}
+    auth = provider.get("auth", {"mode": "none"})
+    if auth.get("mode") == "bearer_env":
+        headers["Authorization"] = f"Bearer {os.environ.get(auth['var'], '')}"
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": agent["prompt"]},
                      {"role": "user", "content": prompt}],
     }
-    req = urllib.request.Request(
-        base + "/chat/completions",
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
-    )
+    req = urllib.request.Request(base + "/chat/completions", data=json.dumps(payload).encode(),
+                                  headers=headers)
     with urllib.request.urlopen(req, timeout=600) as resp:
-        data = json.load(resp)
-    served = data.get("model") or model
+        data = _read_json_response(resp)
+    served_model = data.get("model") or model
     usage = data.get("usage") or {}
-    fallback, reason = classify_fallback(model, served)
-    return {"text": data["choices"][0]["message"]["content"], "served_model": served,
-            "fallback": fallback, "reason": reason,
-            "cost_usd": compute_cost(prices, served, usage),
+    return {"text": data["choices"][0]["message"]["content"], "served_model": served_model,
+            "cost_usd": compute_cost(prices, served_model, usage), "cost_basis": "dollars",
             "input_tokens": usage.get("prompt_tokens", 0), "output_tokens": usage.get("completion_tokens", 0)}
+
+
+def call_cli(provider: dict, prompt: str) -> dict:
+    """cli transport: shell out to a command that already holds its own authenticated
+    session (claude -p, agy-ask.sh). No API key, no usage metadata, no structured HTTP
+    errors: capabilities are declared false in providers.yaml and checked before dispatch
+    ever reaches here. cost_usd is None, never a fabricated dollar figure for a subscription.
+    ponytail: stdout captured whole, no streaming, fixed 600s timeout, one arg template per
+    provider instead of per-CLI code. Upgrade path: per-provider timeout override in
+    providers.yaml if one CLI ever needs it."""
+    args = provider.get("args", ["-p", "{prompt}"])
+    cmd = [provider["command"]] + [prompt if a == "{prompt}" else a for a in args]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"cli provider {provider['command']} exited {result.returncode}: "
+            f"{result.stderr.strip()[:300]}")
+    return {"text": result.stdout.strip(), "served_model": provider.get("model"),
+            "cost_usd": None, "cost_basis": "quota", "input_tokens": None, "output_tokens": None}
+
+
+def dispatch(agent: dict, task: dict, prompt: str, providers: dict, prices: dict,
+             provider_override) -> tuple:
+    """Tries the primary provider/model, then each fallback entry in order, on any error
+    from the call itself. Capability refusals and unknown providers/kinds are hard
+    failures (SystemExit, not an Exception subclass) and are never retried via fallback:
+    that is a configuration problem, not a transient one. If every entry in the chain
+    fails, raises the FIRST error (LangChain's semantics: the last error in a chain usually
+    just says everything failed, the first one says why). Returns (text, attempts), where
+    attempts is one dict per entry tried, win or fail, for the run record."""
+    uses_tools = bool(task.get("uses_tools"))
+    chain = [("echo", agent["model"])] if provider_override == "echo" else agent_model_chain(agent, uses_tools)
+    attempts = []
+    first_error = None
+    for i, (prov_name, model) in enumerate(chain):
+        try:
+            if prov_name == "echo":
+                result = call_echo(agent, prompt, model, prices)
+            else:
+                provider = providers.get(prov_name)
+                if provider is None:
+                    raise SystemExit(f"unknown provider {prov_name!r}")
+                if uses_tools and not provider.get("capabilities", {}).get("tools", False):
+                    raise SystemExit(
+                        f"task needs tools; provider {prov_name!r} does not support them")
+                if provider["kind"] == "openai":
+                    result = call_openai(provider, model, agent, prompt, prices)
+                elif provider["kind"] == "cli":
+                    result = call_cli(provider, prompt)
+                else:
+                    raise SystemExit(f"unknown provider kind {provider['kind']!r}")
+        except Exception as e:
+            if first_error is None:
+                first_error = e
+            attempts.append({"attempt": i, "requested_provider": prov_name, "requested_model": model,
+                              "served_provider": None, "served_model": None, "fallback": i > 0,
+                              "reason": str(e), "ok": False, "cost_usd": 0.0, "cost_basis": "dollars",
+                              "input_tokens": None, "output_tokens": None})
+            continue
+        same_call_fallback, same_call_reason = classify_fallback(model, result["served_model"])
+        fallback = (i > 0) or same_call_fallback
+        reason = (f"attempt {i} after earlier failure: {first_error}" if i > 0
+                  else same_call_reason)
+        attempts.append({"attempt": i, "requested_provider": prov_name, "requested_model": model,
+                          "served_provider": prov_name, "served_model": result["served_model"],
+                          "fallback": fallback, "reason": reason, "ok": True,
+                          "cost_usd": result["cost_usd"], "cost_basis": result.get("cost_basis", "dollars"),
+                          "input_tokens": result.get("input_tokens"), "output_tokens": result.get("output_tokens")})
+        return result["text"], attempts
+    raise first_error
 
 
 def parse_plan(text: str) -> list:
@@ -196,9 +367,10 @@ def parse_plan(text: str) -> list:
 
 
 class Run:
-    def __init__(self, workflow_path=None, provider="9router", resume=None):
-        self.provider = provider
+    def __init__(self, workflow_path=None, provider=None, resume=None):
+        self.provider_override = provider  # None = per-agent routing; "echo" = test stub
         self.prices = load_prices()
+        self.providers = load_providers()
         if resume:
             self.id = resume
             self.dir = RUNS / resume
@@ -226,9 +398,15 @@ class Run:
         if not self.wf.get("tasks"):
             if not self.wf.get("supervisor"):
                 raise SystemExit("workflow needs a tasks list or a supervisor block")
+            sup = self.wf["supervisor"]
+            validate_providers([{"id": "__plan__", "agent": sup.get("agent", "supervisor")}],
+                                self.providers, self.provider_override)
             plan = self.plan_supervisor()
+            validate_providers(plan, self.providers, self.provider_override)
             self.state["generated_tasks"] = plan
             self.wf["tasks"] = plan
+        else:
+            validate_providers(self.wf["tasks"], self.providers, self.provider_override)
         self.save()
 
     def plan_supervisor(self) -> list:
@@ -248,10 +426,11 @@ class Run:
             f"instruction (string), depends_on (list of earlier task ids, [] if none), output "
             f"(short result name). Respond with ONLY the JSON list, no prose, no code fences."
         )
-        result = call_model(agent, prompt, self.provider, self.prices)
-        self.record_model_call("__plan__", agent["model"], result)
-        self.log({"event": "supervisor_planned", "goal": sup["goal"], "raw": result["text"]})
-        plan = parse_plan(result["text"])
+        text, attempts = dispatch(agent, {"id": "__plan__"}, prompt, self.providers, self.prices,
+                                   self.provider_override)
+        self.record_attempts("__plan__", attempts)
+        self.log({"event": "supervisor_planned", "goal": sup["goal"], "raw": text})
+        plan = parse_plan(text)
         if len(plan) > cap:
             plan = plan[:cap]
         if not plan:
@@ -276,18 +455,18 @@ class Run:
         with (self.dir / "log.jsonl").open("a") as fh:
             fh.write(json.dumps(event) + "\n")
 
-    def record_model_call(self, task_id: str, requested_model: str, result: dict):
-        """Fix for reviewer finding 4: every model call lands in log.jsonl as well as
-        state.json, so the append-only log alone can audit which model served a request and
-        what it cost, without needing the snapshot file."""
-        entry = {"task_id": task_id, "requested_model": requested_model,
-                  "served_model": result["served_model"], "fallback": result["fallback"],
-                  "reason": result["reason"], "cost_usd": result["cost_usd"],
-                  "input_tokens": result["input_tokens"], "output_tokens": result["output_tokens"],
-                  "timestamp": time.time()}
-        self.state["model_calls"].append(entry)
-        self.log({"event": "model_call", **entry})
-        self.state["total_cost_usd"] = round(self.state["total_cost_usd"] + result["cost_usd"], 6)
+    def record_attempts(self, task_id: str, attempts: list):
+        """Every attempt, primary or fallback, win or fail, lands in both state.json and
+        log.jsonl: the requested-versus-served fields plus fallback/reason, so the
+        append-only log alone can audit which provider and model actually served a request,
+        and why, without needing the snapshot file (fix for reviewer finding 4, extended to
+        the full provider/fallback chain)."""
+        for attempt in attempts:
+            entry = {"task_id": task_id, **attempt}
+            self.state["model_calls"].append(entry)
+            self.log({"event": "model_call", **entry})
+            if entry.get("cost_usd"):
+                self.state["total_cost_usd"] = round(self.state["total_cost_usd"] + entry["cost_usd"], 6)
 
     def outputs(self) -> dict:
         return {name: v["output"] for name, v in self.wf_outputs().items()}
@@ -342,11 +521,12 @@ class Run:
             prompt = (memory_context(agent) + "\n\n" + prompt).strip()
             self.log({"event": "task_started", "task": task["id"]})
             started = time.time()
-            result = call_model(agent, prompt, self.provider, self.prices)
+            text, attempts = dispatch(agent, task, prompt, self.providers, self.prices,
+                                       self.provider_override)
             self.state["tasks"][name] = {"task_id": task["id"], "agent": task["agent"],
-                                         "status": "done", "output": result["text"],
+                                         "status": "done", "output": text,
                                          "started_at": started, "finished_at": time.time()}
-            self.record_model_call(task["id"], agent["model"], result)
+            self.record_attempts(task["id"], attempts)
             # Fix for reviewer findings 5 and 6: log the task_finished event, then make the
             # state durable (save), and only then perform remember()'s disk write. A crash
             # right after save() means the task is already marked done, so a resume will
@@ -361,7 +541,7 @@ class Run:
             self.log({"event": "task_finished", "task": task["id"]})
             self.save()
             if task.get("remember"):
-                remember(agent, task["remember"], result["text"])
+                remember(agent, task["remember"], text)
         self.state["status"] = "done"
         self.save()
         return self.report()
@@ -386,10 +566,10 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     p_run = sub.add_parser("run")
     p_run.add_argument("workflow")
-    p_run.add_argument("--provider", default="9router")
+    p_run.add_argument("--provider", default=None, help="override, e.g. 'echo' for offline tests")
     p_res = sub.add_parser("resume")
     p_res.add_argument("run_id")
-    p_res.add_argument("--provider", default="9router")
+    p_res.add_argument("--provider", default=None)
     p_st = sub.add_parser("status")
     p_st.add_argument("run_id")
     args = ap.parse_args(argv)

@@ -1,0 +1,26 @@
+providers:
+  router:
+    kind: openai
+    base_url: http://127.0.0.1:20128/v1
+    auth: {mode: bearer_env, var: ORCA_API_KEY}
+    capabilities: {tools: true, usage: true, structured_errors: true}
+
+  ollama:
+    kind: openai
+    base_url: http://127.0.0.1:11434/v1
+    auth: {mode: none}
+    capabilities: {tools: true, usage: true, structured_errors: true}
+
+  claude:
+    kind: cli
+    command: /home/moris/.local/bin/claude
+    args: ["-p", "{prompt}"]
+    model: sonnet
+    capabilities: {tools: false, usage: false, structured_errors: false}
+
+  agy:
+    kind: cli
+    command: /home/moris/.hermes/scripts/agy-ask.sh
+    args: ["{prompt}"]
+    model: gemini-3.1-pro-high
+    capabilities: {tools: false, usage: false, structured_errors: false}
