@@ -23,9 +23,38 @@ import uuid
 
 ROOT = pathlib.Path(os.environ.get("ORCA_HOME") or pathlib.Path(__file__).resolve().parent.parent)
 RUNS = ROOT / "runs"
+PRICES_PATH = ROOT / "engine" / "prices.json"
 
-DEFAULT_PRICE = 0.0  # ponytail: cost accounting is inert until a provider returns pricing.
-                     # Upgrade: parse usage from the response and add a per-model price table.
+
+def load_prices() -> dict:
+    """Per-model USD price per million tokens. Edit engine/prices.json to add or correct a
+    price, no code change needed.
+    ponytail: a static table, no live pricing API call. Upgrade path: fetch the provider's
+    own price endpoint if one is ever exposed, keep this file as the offline fallback."""
+    try:
+        return json.loads(PRICES_PATH.read_text())
+    except FileNotFoundError:
+        return {}
+
+
+def price_for(prices: dict, model: str) -> dict:
+    return prices.get(model) or prices.get("default", {"input_per_mtok": 0.0, "output_per_mtok": 0.0})
+
+
+def compute_cost(prices: dict, model: str, usage: dict) -> float:
+    p = price_for(prices, model)
+    input_tokens = usage.get("prompt_tokens") or 0
+    output_tokens = usage.get("completion_tokens") or 0
+    cost = (input_tokens / 1_000_000) * p["input_per_mtok"] + (output_tokens / 1_000_000) * p["output_per_mtok"]
+    return round(cost, 6)
+
+
+def classify_fallback(requested: str, served: str):
+    """The owner's explicit requirement: a provider swap must show up as a field on the
+    record, never as a silent substitution."""
+    if served == requested:
+        return False, None
+    return True, f"provider served {served!r} instead of requested {requested!r}"
 
 
 def load_structured(path: pathlib.Path):
@@ -86,11 +115,29 @@ def remember(agent: dict, topic: str, text: str) -> pathlib.Path:
     return path
 
 
-def call_model(agent: dict, prompt: str, provider: str) -> dict:
+ECHO_SUPERVISOR_PLAN = json.dumps([
+    {"id": "research", "agent": "researcher", "depends_on": [],
+     "instruction": "In one sentence, what problem does an agent orchestration engine solve?",
+     "output": "research_notes"},
+    {"id": "write", "agent": "writer", "depends_on": ["research"],
+     "instruction": "Turn this into one plain paragraph for a non-technical reader: {{research_notes}}",
+     "output": "final_copy"},
+])  # ponytail: fixed fixture so the supervisor path has a deterministic offline test. Only
+    # used when provider == "echo" and the agent is the supervisor; a live provider call
+    # never sees this string.
+
+
+def call_model(agent: dict, prompt: str, provider: str, prices: dict) -> dict:
     model = agent["model"]
     if provider == "echo":
-        return {"text": f"[echo:{model}] {prompt.splitlines()[0][:120]}",
-                "served_model": model, "fallback": False, "cost_usd": DEFAULT_PRICE}
+        text = ECHO_SUPERVISOR_PLAN if agent["name"] == "supervisor" else (
+            f"[echo:{model}] {prompt.splitlines()[0][:120]}")
+        usage = {"prompt_tokens": len(prompt.split()), "completion_tokens": len(text.split())}
+        served = model
+        fallback, reason = classify_fallback(model, served)
+        return {"text": text, "served_model": served, "fallback": fallback, "reason": reason,
+                "cost_usd": compute_cost(prices, served, usage),
+                "input_tokens": usage["prompt_tokens"], "output_tokens": usage["completion_tokens"]}
     base = os.environ.get("ORCA_BASE_URL", "http://127.0.0.1:20128/v1").rstrip("/")
     key = os.environ.get("ORCA_API_KEY", "")
     payload = {
@@ -106,29 +153,95 @@ def call_model(agent: dict, prompt: str, provider: str) -> dict:
     with urllib.request.urlopen(req, timeout=600) as resp:
         data = json.load(resp)
     served = data.get("model") or model
+    usage = data.get("usage") or {}
+    fallback, reason = classify_fallback(model, served)
     return {"text": data["choices"][0]["message"]["content"], "served_model": served,
-            "fallback": served != model, "cost_usd": DEFAULT_PRICE}
+            "fallback": fallback, "reason": reason,
+            "cost_usd": compute_cost(prices, served, usage),
+            "input_tokens": usage.get("prompt_tokens", 0), "output_tokens": usage.get("completion_tokens", 0)}
+
+
+def parse_plan(text: str) -> list:
+    """Supervisor output must be a JSON list of task dicts. Strip markdown fences if a model
+    wrapped the JSON in them anyway; raise loudly on anything else, never guess a plan."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+    data = json.loads(text)
+    if not isinstance(data, list):
+        raise SystemExit("supervisor plan was not a JSON list")
+    return data
 
 
 class Run:
     def __init__(self, workflow_path=None, provider="9router", resume=None):
+        self.provider = provider
+        self.prices = load_prices()
         if resume:
             self.id = resume
             self.dir = RUNS / resume
             self.state = json.loads((self.dir / "state.json").read_text())
             self.wf = load_structured(ROOT / "workflows" / f"{self.state['workflow']}.yaml")
-            self.provider = provider
+            if not self.wf.get("tasks"):
+                self.wf["tasks"] = self.state.get("generated_tasks") or []
             return
         path = pathlib.Path(workflow_path)
         self.wf = load_structured(path)
-        self.provider = provider
         self.id = uuid.uuid4().hex[:12]
         self.dir = RUNS / self.id
         self.dir.mkdir(parents=True, exist_ok=True)
         self.state = {"run_id": self.id, "workflow": self.wf.get("name", path.stem),
                       "status": "running", "started_at": time.time(), "tasks": {},
-                      "model_calls": [], "total_cost_usd": 0.0}
+                      "model_calls": [], "total_cost_usd": 0.0, "generated_tasks": None}
+        if not self.wf.get("tasks"):
+            if not self.wf.get("supervisor"):
+                raise SystemExit("workflow needs a tasks list or a supervisor block")
+            plan = self.plan_supervisor()
+            self.state["generated_tasks"] = plan
+            self.wf["tasks"] = plan
         self.save()
+
+    def plan_supervisor(self) -> list:
+        """One bounded planning call: a goal becomes at most max_subtasks tasks. The cap is
+        enforced here in code after the call returns, not trusted to the prompt. Runs exactly
+        once, from __init__: there is no path that calls this twice for the same run, so there
+        is no re-planning mid-run."""
+        sup = self.wf["supervisor"]
+        cap = self.wf.get("max_subtasks", 5)
+        agent_name = sup.get("agent", "supervisor")
+        agent = load_agent(agent_name)
+        agent_names = sorted(p.stem for p in (ROOT / "agents").glob("*.md") if p.stem != agent_name)
+        prompt = (
+            f"Goal: {sup['goal']}\n\n"
+            f"Produce a JSON list of at most {cap} tasks to achieve this goal. Each task is an "
+            f"object with keys: id (short slug), agent (one of: {', '.join(agent_names)}), "
+            f"instruction (string), depends_on (list of earlier task ids, [] if none), output "
+            f"(short result name). Respond with ONLY the JSON list, no prose, no code fences."
+        )
+        result = call_model(agent, prompt, self.provider, self.prices)
+        self.state["model_calls"].append({
+            "task_id": "__plan__", "requested_model": agent["model"],
+            "served_model": result["served_model"], "fallback": result["fallback"],
+            "reason": result["reason"], "cost_usd": result["cost_usd"],
+            "input_tokens": result["input_tokens"], "output_tokens": result["output_tokens"],
+            "timestamp": time.time()})
+        self.state["total_cost_usd"] = round(self.state["total_cost_usd"] + result["cost_usd"], 6)
+        self.log({"event": "supervisor_planned", "goal": sup["goal"], "raw": result["text"]})
+        plan = parse_plan(result["text"])
+        if len(plan) > cap:
+            plan = plan[:cap]
+        if not plan:
+            raise SystemExit("supervisor produced zero tasks")
+        for task in plan:
+            missing = [k for k in ("id", "agent", "instruction", "output") if k not in task]
+            if missing:
+                raise SystemExit(f"supervisor task missing fields {missing}: {task}")
+            if not (ROOT / "agents" / f"{task['agent']}.md").exists():
+                raise SystemExit(f"supervisor assigned unknown agent {task['agent']!r}")
+            task.setdefault("depends_on", [])
+        return plan
 
     def save(self):
         """Durability: atomic replace after every task, so a crash never leaves a half state."""
@@ -192,15 +305,16 @@ class Run:
             prompt = (memory_context(agent) + "\n\n" + prompt).strip()
             self.log({"event": "task_started", "task": task["id"]})
             started = time.time()
-            result = call_model(agent, prompt, self.provider)
+            result = call_model(agent, prompt, self.provider, self.prices)
             self.state["tasks"][name] = {"task_id": task["id"], "agent": task["agent"],
                                          "status": "done", "output": result["text"],
                                          "started_at": started, "finished_at": time.time()}
             self.state["model_calls"].append({
                 "task_id": task["id"], "requested_model": agent["model"],
                 "served_model": result["served_model"], "fallback": result["fallback"],
-                "reason": None if not result["fallback"] else "provider returned another model",
-                "cost_usd": result["cost_usd"], "timestamp": time.time()})
+                "reason": result["reason"], "cost_usd": result["cost_usd"],
+                "input_tokens": result["input_tokens"], "output_tokens": result["output_tokens"],
+                "timestamp": time.time()})
             self.state["total_cost_usd"] = round(
                 self.state["total_cost_usd"] + result["cost_usd"], 6)
             if task.get("remember"):

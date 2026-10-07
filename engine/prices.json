@@ -1,0 +1,7 @@
+{
+  "_comment": "USD per million tokens. Edit this file to add or correct a model price, no code change needed. Approximate list prices, not fetched live from any provider.",
+  "sonnet": {"input_per_mtok": 3.0, "output_per_mtok": 15.0},
+  "opus": {"input_per_mtok": 15.0, "output_per_mtok": 75.0},
+  "haiku": {"input_per_mtok": 0.8, "output_per_mtok": 4.0},
+  "default": {"input_per_mtok": 0.0, "output_per_mtok": 0.0}
+}

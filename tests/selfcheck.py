@@ -15,6 +15,11 @@ ENGINE = ORCA / "engine" / "orca.py"
 TEST_PY = "/usr/bin/python3"   # system python has PyYAML; the Hermes tool python does not
 ENV = {**os.environ, "ORCA_HOME": str(ORCA)}
 
+sys.path.insert(0, str(ORCA / "engine"))
+import orca as engine  # noqa: E402  (pure-function checks call the module directly; the
+                        # `orca` name below is the subprocess-CLI helper, kept for the
+                        # existing tests)
+
 
 def orca(*args):
     return subprocess.run([TEST_PY, str(ENGINE), *args], capture_output=True,
@@ -57,7 +62,7 @@ run = orca.Run({str(wf)!r}, provider="echo")
 tasks = run.order()
 first = tasks[0]
 agent = orca.load_agent(first["agent"])
-res = orca.call_model(agent, first["instruction"], "echo")
+res = orca.call_model(agent, first["instruction"], "echo", orca.load_prices())
 run.state["tasks"][first.get("output", first["id"])] = {{
     "task_id": first["id"], "agent": first["agent"], "status": "done",
     "output": res["text"], "started_at": 0, "finished_at": 0}}
@@ -92,9 +97,83 @@ def test_dependency_cycle_detected():
     wf.unlink()
 
 
+def test_cost_and_model_accounting():
+    """Offline: price table lookup is exact, and a full run carries real tokens/cost."""
+    prices = engine.load_prices()
+    assert "sonnet" in prices, "engine/prices.json missing a sonnet entry"
+    usage = {"prompt_tokens": 1000, "completion_tokens": 500}
+    p = prices["sonnet"]
+    expected = round(1000 / 1e6 * p["input_per_mtok"] + 500 / 1e6 * p["output_per_mtok"], 6)
+    got = engine.compute_cost(prices, "sonnet", usage)
+    assert got == expected, (got, expected)
+    assert engine.classify_fallback("sonnet", "sonnet") == (False, None)
+    fallback, reason = engine.classify_fallback("sonnet", "haiku")
+    assert fallback is True and "haiku" in reason and "sonnet" in reason, (fallback, reason)
+
+    r = orca("run", "workflows/hello.yaml", "--provider", "echo")
+    assert r.returncode == 0, r.stderr
+    report = json.loads(r.stdout.split("\n", 1)[1])
+    calls = load_run(report["run_id"])["model_calls"]
+    assert all("input_tokens" in c and "output_tokens" in c for c in calls), calls
+    assert all(c["cost_usd"] > 0 for c in calls), "sonnet is priced, cost_usd must be nonzero"
+    print(f"  ok cost accounting: compute_cost matches prices.json, "
+          f"{len(calls)} model_calls carry real tokens and nonzero cost")
+
+
+def test_supervisor_bounded_plan():
+    """Offline: one planning call turns a goal into tasks that run through the normal
+    executor, and the max_subtasks cap is enforced in code even when the plan exceeds it."""
+    r = orca("run", "workflows/launch-plan.yaml", "--provider", "echo")
+    assert r.returncode == 0, r.stderr
+    report = json.loads(r.stdout.split("\n", 1)[1])
+    state = load_run(report["run_id"])
+    assert state["status"] == "done", state["status"]
+    assert len(state["generated_tasks"]) == 2, state["generated_tasks"]
+    assert [t["task_id"] for t in state["tasks"].values()] == ["research", "write"], state["tasks"]
+    plan_calls = [c for c in state["model_calls"] if c["task_id"] == "__plan__"]
+    assert len(plan_calls) == 1, "supervisor planned more than once"
+    print(f"  ok supervisor plan: {report['run_id']} goal -> 2 tasks, ran end to end, "
+          f"planned exactly once")
+
+    wf = ORCA / "workflows" / "_captest.yaml"
+    wf.write_text("name: _captest\nmax_cost_usd: 1.0\nmax_subtasks: 1\n"
+                  "supervisor:\n  goal: test goal\n")
+    r = orca("run", str(wf), "--provider", "echo")
+    assert r.returncode == 0, r.stderr
+    report = json.loads(r.stdout.split("\n", 1)[1])
+    state = load_run(report["run_id"])
+    assert len(state["generated_tasks"]) == 1, "max_subtasks cap not enforced in code"
+    assert list(state["tasks"]) == ["research_notes"], state["tasks"]
+    wf.unlink()
+    print("  ok cap enforced: a 2-task echo plan truncated to 1 under max_subtasks=1, in code")
+
+
+def test_live_fallback_reporting():
+    """Live-only: proves requested/served model, fallback, reason and cost_usd come from a
+    real OpenAI-compatible response. Needs ORCA_BASE_URL reachable; if it is not, this is
+    reported plainly as skipped and never counted as a pass."""
+    import urllib.error
+    agent = engine.load_agent("researcher")
+    prices = engine.load_prices()
+    try:
+        result = engine.call_model(agent, "ping", "9router", prices)
+    except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
+        print(f"  live-only: provider unreachable ({e}); skipped, not counted as a pass")
+        return "skipped"
+    for key in ("served_model", "fallback", "reason", "cost_usd"):
+        assert key in result, result
+    print(f"  ok live fallback: requested=sonnet served={result['served_model']} "
+          f"fallback={result['fallback']} cost_usd={result['cost_usd']}")
+    return "ran"
+
+
 if __name__ == "__main__":
     print("orca self-check")
     test_full_run()
     test_resume_skips_finished()
     test_dependency_cycle_detected()
-    print("3/3 ok")
+    test_cost_and_model_accounting()
+    test_supervisor_bounded_plan()
+    print("5/5 ok")
+    live = test_live_fallback_reporting()
+    print("+1 live-only ran" if live == "ran" else "+1 live-only skipped (offline)")

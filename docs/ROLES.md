@@ -16,9 +16,12 @@ model families, two separate quota pools, so the audit costs no Claude window.
 
 ## Routing rules
 
-1. **Design and code** go to Claude, `sonnet`, no subagents, `--max-turns` set, one notes file per
-   lane written incrementally. Fixed session id for the topic, resumed rather than restarted:
+1. **Design and code** go to Claude, `sonnet`, one notes file per lane written incrementally. Fixed
+   session id for the topic, resumed rather than restarted:
    `7b888a7b-5e3f-4209-8d54-6e63a7e13b94`.
+   A coding launch may open **at most two children, reviewers only, never writers**, and the cap is
+   written into the brief. `Task` must be in `--allowedTools` for that to be possible at all: the
+   tool is refused mechanically when it is absent from the list.
 2. **Audit and second opinion** go to `agy` via `~/.hermes/scripts/agy-ask.sh`, mode `plan`
    (read-only). It reads the tree and reports; it does not edit.
 3. **Integration, commits, tests** stay with Hermes. Nothing else pushes to the repo.
