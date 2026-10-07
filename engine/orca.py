@@ -96,6 +96,87 @@ def load_structured(path: pathlib.Path):
         return json.loads(text)
 
 
+def task_graph(workflow) -> str:
+    """Mermaid graph of a workflow's task dependencies. The cheapest visual: GitHub and Obsidian
+    render these natively, so the shape is visible from a fenced block with no UI at all.
+
+    ponytail: labels are ids, agents and providers only. Add per-task cost or model-served badges
+    when the graph is generated from a finished run rather than from the workflow file.
+    """
+    tasks = workflow["tasks"]
+    lines = ["graph TD"]
+    for t in tasks:
+        label = t["id"]
+        agent_name = t.get("agent")
+        provider = ""
+        try:
+            agent_meta = load_agent(agent_name) if agent_name else {}
+            provider = agent_meta.get("provider", "")
+        except SystemExit:
+            provider = "MISSING"
+        bits = " / ".join(x for x in (agent_name, provider) if x)
+        lines.append(f'    {t["id"]}["{label}<br/>{bits}"]' if bits else f'    {t["id"]}["{label}"]')
+    for t in tasks:
+        for dep in t.get("depends_on", []) or []:
+            lines.append(f"    {dep} --> {t['id']}")
+    return "\n".join(lines)
+
+
+def validate_workflow(path: pathlib.Path) -> list:
+    """Every reason this workflow cannot run, as strings. Empty list means it is runnable.
+    Checks what a live run would otherwise discover halfway through: dangling agent and provider
+    references, a dependency on a task that does not exist, and a cycle."""
+    problems = []
+    try:
+        wf = load_structured(path)
+    except Exception as exc:  # noqa: BLE001 - the parse error text is the useful part
+        return [f"{path}: cannot parse: {exc}"]
+    if not isinstance(wf, dict) or "tasks" not in wf:
+        return [f"{path}: no 'tasks' list"]
+    providers = {}
+    providers_path = ROOT / "providers.yaml"
+    if providers_path.exists():
+        providers = (load_structured(providers_path) or {}).get("providers", {}) or {}
+    ids = [t.get("id") for t in wf["tasks"]]
+    for t in wf["tasks"]:
+        tid = t.get("id")
+        if not tid:
+            problems.append("a task has no id")
+            continue
+        if not t.get("agent"):
+            problems.append(f"task {tid}: no agent")
+            continue
+        try:
+            agent_meta = load_agent(t["agent"])
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"task {tid}: agent {t['agent']!r} unusable: {exc}")
+            continue
+        prov = agent_meta.get("provider")
+        if providers and prov not in providers:
+            problems.append(
+                f"task {tid}: agent {t['agent']!r} names provider {prov!r}, "
+                f"not in providers.yaml (have: {', '.join(sorted(providers)) or 'none'})")
+        for dep in t.get("depends_on", []) or []:
+            if dep not in ids:
+                problems.append(f"task {tid}: depends_on {dep!r} which is not a task id")
+    index = {t.get("id"): t for t in wf["tasks"] if t.get("id")}
+    seen, stack = set(), []
+    def visit(tid, trail):
+        stack.append(tid)
+        for dep in index[tid].get("depends_on", []) or []:
+            if dep in stack:
+                problems.append(f"dependency cycle: {' -> '.join(stack + [dep])}")
+                return
+            if dep in index:
+                visit(dep, trail + [dep])
+        stack.pop()
+        seen.add(tid)
+    for tid in index:
+        if tid not in seen:
+            visit(tid, [tid])
+    return problems
+
+
 def load_structured_text(text: str):
     try:
         import yaml
@@ -572,8 +653,23 @@ def main(argv=None):
     p_res.add_argument("--provider", default=None)
     p_st = sub.add_parser("status")
     p_st.add_argument("run_id")
+    p_graph = sub.add_parser("graph")
+    p_graph.add_argument("workflow")
+    p_val = sub.add_parser("validate")
+    p_val.add_argument("workflow")
     args = ap.parse_args(argv)
 
+    if args.cmd == "graph":
+        print(task_graph(load_structured(pathlib.Path(args.workflow))))
+        return 0
+    if args.cmd == "validate":
+        problems = validate_workflow(pathlib.Path(args.workflow))
+        if not problems:
+            print(f"{args.workflow}: ok")
+            return 0
+        for p_ in problems:
+            print(f"PROBLEM {p_}")
+        return 1
     if args.cmd == "run":
         run = Run(args.workflow, provider=args.provider)
         print(json.dumps({"run_id": run.id, "log": str(run.dir / "log.jsonl")}))

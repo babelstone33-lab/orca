@@ -5,3 +5,5 @@
 [echo:sonnet] KNOWN NOTES:
 [echo:qwen3:4b] KNOWN NOTES:
 [echo:qwen3:4b] KNOWN NOTES:
+[echo:qwen3:4b] KNOWN NOTES:
+[echo:qwen3:4b] KNOWN NOTES:
