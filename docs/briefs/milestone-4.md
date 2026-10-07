@@ -99,6 +99,17 @@ for a subscription.
 - No hand-written OAuth. A subscription is reached through the CLI that already holds the session.
 - No secret on disk outside `.env`.
 
+## How to work
+
+Incremental, because a quota wall can land mid-run. After each of the four build steps below,
+run the self-check, then commit locally (`git add -A && git commit`), so an interruption costs at
+most one step rather than the whole milestone. Do not push.
+
+Order: (1) `providers.yaml` plus the loader and capability validation, (2) the `openai` transport
+with tokens and cost, (3) the `cli` transport declared as degraded, (4) the ordered fallback chain
+plus the four requested-versus-served fields. Steps 2 and 3 are independent of 4; if the window
+runs short, 1 to 3 landing complete and verified is a good result and 4 is a fine next-session task.
+
 ## Acceptance
 
 1. A three-task workflow, each task on a different provider: no-auth local, bearer-key hosted, CLI
