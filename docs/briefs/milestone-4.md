@@ -1,81 +1,110 @@
-# Milestone 4 spec: the provider layer (one agent, one model, one auth)
+# Milestone 4 spec: the provider layer (rewritten against source)
+
+This supersedes the earlier draft of this file, which was written from memory. The corrections come
+from reading real source, recorded in `docs/research/provider-layer-map.md`: CrewAI's `llm.py` and
+`agent/core.py`, LangChain's `chat_models/base.py` and `runnables/fallbacks.py`. Every line
+reference there was read this session by two subagents and re-checked by the orchestrator.
 
 Mor's requirement, in his words: every agent may use a different LLM, a different API, a local
 model, or an authenticated subscription. The engine must not assume one endpoint.
 
-## Design: two transports, one interface
+## Two transports, one interface
 
-Everything he listed collapses into exactly two call shapes. Do not build more.
-
-| kind | Covers | Auth modes |
+| kind | Covers | Auth |
 |---|---|---|
-| `openai` | any OpenAI-compatible HTTP endpoint: 9router, OpenRouter, OpenAI, Anthropic-compat gateways, Ollama, LM Studio, llama.cpp, vLLM | `none` (local), `bearer_env` (key from an env var) |
-| `cli` | a subscription that authenticates through a logged-in CLI, not an HTTP key: Claude Code (`claude -p`), Antigravity (`agy -p`) | the CLI's own session, no key in config |
+| `openai` | any OpenAI-compatible endpoint: 9router, OpenRouter, OpenAI, Ollama, LM Studio, vLLM | `none` or `bearer_env` |
+| `cli` | a subscription with no API key: `claude -p`, `agy -p` | the CLI's own logged-in session |
 
-That is the whole matrix. A new provider is a config entry, never a code change.
+Capabilities are declared per provider, never assumed:
 
-## Config
+```yaml
+capabilities: {tools: true, usage: true, structured_errors: true}
+```
 
-`providers.yaml` at the repo root, one entry per endpoint:
+A CLI provider declares `tools: false, usage: false, structured_errors: false`. The engine refuses
+to route a task that needs tools to a provider without them. A hard failure at startup or dispatch,
+never a silent downgrade. This answers the live 404 found in milestone 3: an agent pointing at a
+model the endpoint does not expose must stop the run, not fall through to another provider by
+accident.
+
+## The registry is data, not classes
+
+`providers.yaml`, one table. No class per provider, no import per provider, no LiteLLM dependency.
+LangChain's `_BUILTIN_PROVIDERS` (name to module/class/factory, `base.py:56-99`) proves a table
+covers this. CrewAI pays a class per provider plus a LiteLLM fallback; that weight buys nothing here.
 
 ```yaml
 providers:
-  router:
-    kind: openai
-    base_url: http://127.0.0.1:20128/v1
-    auth: {mode: bearer_env, var: ORCA_API_KEY}
-  ollama:
-    kind: openai
-    base_url: http://127.0.0.1:11434/v1
-    auth: {mode: none}
-  claude:
-    kind: cli
-    command: /home/moris/.local/bin/claude
-    args: ["-p", "{prompt}", "--model", "{model}", "--output-format", "json"]
-  antigravity:
-    kind: cli
-    command: /home/moris/.hermes/scripts/agy-ask.sh
-    args: ["{prompt}", "{cwd}", "{model}"]
+  router:  {kind: openai, base_url: http://127.0.0.1:20128/v1, auth: {mode: bearer_env, var: ORCA_API_KEY}}
+  ollama:  {kind: openai, base_url: http://127.0.0.1:11434/v1, auth: {mode: none}}
+  claude:  {kind: cli, command: /home/moris/.local/bin/claude, model: sonnet,
+            capabilities: {tools: false, usage: false, structured_errors: false}}
+  agy:     {kind: cli, command: /home/moris/.hermes/scripts/agy-ask.sh, model: gemini-3.1-pro-high,
+            capabilities: {tools: false, usage: false, structured_errors: false}}
 ```
 
-No secret ever lives in this file. Only the name of an environment variable does. `.env` holds the
-values and stays gitignored.
+No secret in this file, only the name of an environment variable. Values live in `.env`, gitignored.
 
-## Agent frontmatter
+## Two models per agent
+
+Taken from CrewAI's `llm` plus `function_calling_llm` split (`agent/core.py:270,275`), cut down to
+the useful two. This is the real cost lever: a cheap model for text, a capable one for tool calls.
 
 ```yaml
 ---
-provider: router          # optional; defaults to the workflow's provider, then to `router`
-model: ds/deepseek-v4-pro # optional; defaults per provider
-fallback: [ollama:llama3, claude:haiku]   # optional, ordered
+provider: router
+model: ds/deepseek-v4-pro        # text work
+tool_provider: router            # optional; only consulted when the task uses tools
+tool_model: MyThinkingcombo
+fallback: [ollama:llama3]        # ordered, tried on failure of any attempt
 ---
 ```
 
-`fallback` is the part Mor already asked for in a different form: he wants to know when a provider
-was swapped, never a silent swap. So on every fallback the run record writes
-`requested_provider`, `served_provider`, `fallback: true` and a `reason`. A fallback that cannot be
-observed is the same defect as no fallback at all.
+`model` alone is enough. `tool_model` is opt-in. CrewAI carries five model fields at crew level
+(`manager_llm`, `manager_agent`, `function_calling_llm`, `planning_llm`, `chat_llm`); for a single
+owner, two at agent level covers the ground.
 
-## Run record additions
+**Model ids must exist.** Every declared model is validated against the provider's live model list
+at startup; a dangling reference refuses the run. Verified basis: this 9router instance exposes 25
+ids, none Anthropic, so `model: sonnet` against it must fail loudly rather than 404 mid-run.
 
-`model_calls[]` gains `requested_provider` and `served_provider` beside the existing
-`requested_model` / `served_model`, plus `transport` (`openai` or `cli`) and the existing token and
-cost fields. Cost for a `cli` transport is quota, not money: record it as `cost_usd: null` with
-`cost_basis: "quota"`, never as a fabricated number.
+## Fallback, observable by construction
+
+An ordered list, tried on error, not on a poor answer. When every entry fails, raise the FIRST error
+(LangChain's semantics, `fallbacks.py:211`; raising the last hides the real cause).
+
+Every attempt writes to the run record:
+
+```
+requested_provider, requested_model, served_provider, served_model, fallback, reason
+```
+
+Neither framework does this, and it is the cheapest thing in this design to build:
+
+- CrewAI has no cross-provider fallback at all, and its events carry the requested model only
+  (`llms/base_llm.py:674`).
+- LangChain has `with_fallbacks`, but the winning runnable appears only in callback child-run
+  structure, never in the returned data (`fallbacks.py:178-190`), and its own code notes
+  `model_name` reflects the request unless a gateway re-routed.
+
+## Cost
+
+`openai` transport: tokens from the response, price from `engine/prices.json`, `cost_usd` a real
+number. `cli` transport: `cost_usd: null`, `cost_basis: "quota"`. Never fabricate a dollar figure
+for a subscription.
 
 ## What stays out
 
-- No plugin registry, no adapter class per provider, no dynamic import. Two branches in one
-  function.
-- No OAuth flow written by hand. A subscription is reached through the CLI that already holds the
-  session.
+- No class per provider, no dynamic import, no LiteLLM. Two branches in one function.
+- No hand-written OAuth. A subscription is reached through the CLI that already holds the session.
 - No secret on disk outside `.env`.
 
 ## Acceptance
 
-1. One workflow with three tasks, each on a different provider: a local model with no auth, a
-   hosted model through the router with a bearer key, and a CLI subscription. Runs end to end.
-2. `tests/selfcheck.py` proves provider selection and the fallback path with the offline echo
-   transport, and labels any live-only check loudly instead of passing it silently.
-3. A forced bad provider (wrong port) falls back to the next entry in `fallback` and the run record
-   shows all three fields: requested, served, reason.
+1. A three-task workflow, each task on a different provider: no-auth local, bearer-key hosted, CLI
+   subscription. Runs end to end with the real output pasted.
+2. `tests/selfcheck.py` proves offline: per-task provider selection, `tool_model` chosen only when
+   tools are used, dangling-model refusal, the fallback chain, and that the requested-versus-served
+   fields are written on a forced failure. Live checks skip loudly.
+3. Force a bad provider (wrong port). The next fallback entry serves it and the run record shows
+   requested, served and reason for both attempts.
