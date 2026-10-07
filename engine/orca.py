@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""Orca: thin agent-orchestration engine. Four primitives, no agent framework.
+
+  Agent     agents/<name>.md   YAML frontmatter (model, tools) plus a prompt body
+  Task      one entry in a workflow file: agent, instruction, depends_on, output, remember
+  Workflow  workflows/<name>.yaml   name, max_cost_usd, tasks[]
+  Run       runs/<run_id>/{state.json, log.jsonl}   durable, resumable
+
+Usage:
+  python3 engine/orca.py run workflows/hello.yaml [--provider echo|9router]
+  python3 engine/orca.py resume <run_id>
+  python3 engine/orca.py status <run_id>
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import time
+import urllib.request
+import uuid
+
+ROOT = pathlib.Path(os.environ.get("ORCA_HOME") or pathlib.Path(__file__).resolve().parent.parent)
+RUNS = ROOT / "runs"
+
+DEFAULT_PRICE = 0.0  # ponytail: cost accounting is inert until a provider returns pricing.
+                     # Upgrade: parse usage from the response and add a per-model price table.
+
+
+def load_structured(path: pathlib.Path):
+    """Read YAML when PyYAML is present, JSON otherwise. Both are already-installed options."""
+    text = path.read_text()
+    if path.suffix == ".json":
+        return json.loads(text)
+    try:
+        import yaml
+        return yaml.safe_load(text)
+    except ImportError:
+        return json.loads(text)
+
+
+def load_agent(name: str) -> dict:
+    path = ROOT / "agents" / f"{name}.md"
+    raw = path.read_text()
+    meta, body = {}, raw
+    if raw.startswith("---"):
+        _, front, body = raw.split("---", 2)
+        meta = load_structured_text(front)
+    meta.setdefault("model", "sonnet")
+    meta["name"] = name
+    meta["prompt"] = body.strip()
+    meta["memory_dir"] = ROOT / "memory" / name
+    return meta
+
+
+def load_structured_text(text: str):
+    try:
+        import yaml
+        return yaml.safe_load(text) or {}
+    except ImportError:
+        return json.loads(text)
+
+
+def memory_context(agent: dict) -> str:
+    """Read path for per-agent memory: the index plus any notes the task names."""
+    index = agent["memory_dir"] / "index.md"
+    if not index.exists():
+        return ""
+    return "KNOWN NOTES:\n" + index.read_text().strip()
+
+
+def remember(agent: dict, topic: str, text: str) -> pathlib.Path:
+    """Write path for per-agent memory. Explicit only: never inferred from free text."""
+    notes = agent["memory_dir"] / "notes"
+    notes.mkdir(parents=True, exist_ok=True)
+    path = notes / f"{topic}.md"
+    with path.open("a") as fh:
+        fh.write(text.rstrip() + "\n")
+    index = agent["memory_dir"] / "index.md"
+    line = f"- {topic}: {notes[topic] if False else text.strip().splitlines()[0][:90]}\n"
+    existing = index.read_text() if index.exists() else ""
+    if f"- {topic}:" not in existing:
+        with index.open("a") as fh:
+            fh.write(line)
+    return path
+
+
+def call_model(agent: dict, prompt: str, provider: str) -> dict:
+    model = agent["model"]
+    if provider == "echo":
+        return {"text": f"[echo:{model}] {prompt.splitlines()[0][:120]}",
+                "served_model": model, "fallback": False, "cost_usd": DEFAULT_PRICE}
+    base = os.environ.get("ORCA_BASE_URL", "http://127.0.0.1:20128/v1").rstrip("/")
+    key = os.environ.get("ORCA_API_KEY", "")
+    payload = {
+        "model": model,
+        "messages": [{"role": "system", "content": agent["prompt"]},
+                     {"role": "user", "content": prompt}],
+    }
+    req = urllib.request.Request(
+        base + "/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+    )
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        data = json.load(resp)
+    served = data.get("model") or model
+    return {"text": data["choices"][0]["message"]["content"], "served_model": served,
+            "fallback": served != model, "cost_usd": DEFAULT_PRICE}
+
+
+class Run:
+    def __init__(self, workflow_path=None, provider="9router", resume=None):
+        if resume:
+            self.id = resume
+            self.dir = RUNS / resume
+            self.state = json.loads((self.dir / "state.json").read_text())
+            self.wf = load_structured(ROOT / "workflows" / f"{self.state['workflow']}.yaml")
+            self.provider = provider
+            return
+        path = pathlib.Path(workflow_path)
+        self.wf = load_structured(path)
+        self.provider = provider
+        self.id = uuid.uuid4().hex[:12]
+        self.dir = RUNS / self.id
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.state = {"run_id": self.id, "workflow": self.wf.get("name", path.stem),
+                      "status": "running", "started_at": time.time(), "tasks": {},
+                      "model_calls": [], "total_cost_usd": 0.0}
+        self.save()
+
+    def save(self):
+        """Durability: atomic replace after every task, so a crash never leaves a half state."""
+        tmp = self.dir / "state.json.tmp"
+        tmp.write_text(json.dumps(self.state, indent=2))
+        os.replace(tmp, self.dir / "state.json")
+
+    def log(self, event: dict):
+        event["timestamp"] = time.time()
+        with (self.dir / "log.jsonl").open("a") as fh:
+            fh.write(json.dumps(event) + "\n")
+
+    def outputs(self) -> dict:
+        return {t["output"]: v["output"] for t, v in self.wf_outputs().items()}
+
+    def wf_outputs(self):
+        out = {}
+        for task in self.wf["tasks"]:
+            name = task.get("output", task["id"])
+            if name in self.state["tasks"]:
+                out[task] = self.state["tasks"][name]
+        return out
+
+    def order(self) -> list:
+        tasks = self.wf["tasks"]
+        names = [t["id"] for t in tasks]
+        done, order = [], []
+        while len(order) < len(tasks):
+            progressed = False
+            for t in tasks:
+                if t["id"] in order:
+                    continue
+                if all(d in order for d in t.get("depends_on", [])):
+                    order.append(t["id"])
+                    progressed = True
+            if not progressed:
+                stuck = [n for n in names if n not in order]
+                raise SystemExit(f"dependency cycle or unknown depends_on: {stuck}")
+        by_id = {t["id"]: t for t in tasks}
+        return [by_id[i] for i in order]
+
+    def render(self, text: str) -> str:
+        for task in self.wf["tasks"]:
+            out = task.get("output", task["id"])
+            if out in self.state["tasks"]:
+                text = text.replace("{{" + out + "}}", self.state["tasks"][out]["output"])
+        return text
+
+    def execute(self) -> dict:
+        cap = self.wf.get("max_cost_usd")
+        for task in self.order():
+            name = task.get("output", task["id"])
+            if name in self.state["tasks"] and self.state["tasks"][name]["status"] == "done":
+                continue
+            if cap is not None and self.state["total_cost_usd"] >= cap:
+                self.state["status"] = "cost_capped"
+                self.save()
+                return self.report()
+            agent = load_agent(task["agent"])
+            prompt = self.render(task["instruction"])
+            prompt = (memory_context(agent) + "\n\n" + prompt).strip()
+            self.log({"event": "task_started", "task": task["id"]})
+            started = time.time()
+            result = call_model(agent, prompt, self.provider)
+            self.state["tasks"][name] = {"task_id": task["id"], "agent": task["agent"],
+                                         "status": "done", "output": result["text"],
+                                         "started_at": started, "finished_at": time.time()}
+            self.state["model_calls"].append({
+                "task_id": task["id"], "requested_model": agent["model"],
+                "served_model": result["served_model"], "fallback": result["fallback"],
+                "reason": None if not result["fallback"] else "provider returned another model",
+                "cost_usd": result["cost_usd"], "timestamp": time.time()})
+            self.state["total_cost_usd"] = round(
+                self.state["total_cost_usd"] + result["cost_usd"], 6)
+            if task.get("remember"):
+                remember(agent, task["remember"], result["text"])
+            self.save()
+            self.log({"event": "task_finished", "task": task["id"]})
+        self.state["status"] = "done"
+        self.save()
+        return self.report()
+
+    def report(self) -> dict:
+        final = self.wf["tasks"][-1]
+        last = self.state["tasks"].get(final.get("output", final["id"]), {})
+        return {"run_id": self.id, "status": self.state["status"],
+                "total_cost_usd": self.state["total_cost_usd"],
+                "tasks": [{"id": v["task_id"], "agent": v["agent"],
+                           "summary": v["output"].strip().splitlines()[0][:140]}
+                          for v in self.state["tasks"].values()],
+                "model_calls": self.state["model_calls"],
+                "final_output": last.get("output", ""),
+                "log": str(self.dir / "log.jsonl")}
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="orca")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p_run = sub.add_parser("run")
+    p_run.add_argument("workflow")
+    p_run.add_argument("--provider", default="9router")
+    p_res = sub.add_parser("resume")
+    p_res.add_argument("run_id")
+    p_res.add_argument("--provider", default="9router")
+    p_st = sub.add_parser("status")
+    p_st.add_argument("run_id")
+    args = ap.parse_args(argv)
+
+    if args.cmd == "run":
+        run = Run(args.workflow, provider=args.provider)
+        print(json.dumps({"run_id": run.id, "log": str(run.dir / "log.jsonl")}))
+        report = run.execute()
+    elif args.cmd == "resume":
+        report = Run(resume=args.run_id, provider=args.provider).execute()
+    else:
+        state = json.loads((RUNS / args.run_id / "state.json").read_text())
+        print(json.dumps({"run_id": args.run_id, "status": state["status"],
+                          "tasks": {k: v["status"] for k, v in state["tasks"].items()}}, indent=2))
+        return 0
+    print(json.dumps(report, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
