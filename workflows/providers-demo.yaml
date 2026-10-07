@@ -1,0 +1,20 @@
+name: providers-demo
+max_cost_usd: 0.50
+
+tasks:
+  - id: local
+    agent: researcher
+    instruction: "In one sentence, what is the capital of France?"
+    output: local_answer
+
+  - id: hosted
+    agent: writer
+    depends_on: [local]
+    instruction: "In one sentence, restate this fact in your own words: {{local_answer}}"
+    output: hosted_answer
+
+  - id: subscription
+    agent: reviewer
+    depends_on: [hosted]
+    instruction: "In one sentence, confirm whether this statement sounds correct: {{hosted_answer}}"
+    output: final_review
